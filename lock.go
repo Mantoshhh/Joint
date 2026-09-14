@@ -21,22 +21,6 @@ type Lock struct {
 	value   string
 }
 
-const releaseScript string = `
-	if redis.call("get", KEYS[1]) == ARGV[1] then
-		return redis.call("del", KEYS[1])
-	else
-		return 0
-	end
-`
-
-const extendScript string = `
-	if redis.call("get", KEYS[1]) == ARGV[1] then
-		return redis.call("pexpire", KEYS[1], ARGV[2])
-	else
-		return 0
-	end
-`
-
 func (l *Lock) fanOut(op func(redisClient) (bool, error)) (successCount int, errs []error) {
 	results := make(chan bool, len(l.clients))
 	errCh := make(chan error, len(l.clients))
