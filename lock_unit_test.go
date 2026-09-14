@@ -38,17 +38,19 @@ func (f *fakeRedisClient) Eval(ctx context.Context, script string, keys []string
 	return cmd
 }
 
-func TestAcquireSucceedsWithFakeMajority(t *testing.T) {
+func TestAcquireSucceeds(t *testing.T) {
+	clients := []redisClient{
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: false},
+		&fakeRedisClient{setNXResult: false}}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: false},
-			&fakeRedisClient{setNXResult: false},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	acquired, token, err := lock.Acquire(context.Background())
@@ -63,17 +65,19 @@ func TestAcquireSucceedsWithFakeMajority(t *testing.T) {
 	}
 }
 
-func TestAcquireFailsWithFakeMinority(t *testing.T) {
+func TestAcquireFails(t *testing.T) {
+	clients := []redisClient{
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: false},
+		&fakeRedisClient{setNXResult: false},
+		&fakeRedisClient{setNXResult: false}}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: false},
-			&fakeRedisClient{setNXResult: false},
-			&fakeRedisClient{setNXResult: false},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	acquired, token, err := lock.Acquire(context.Background())
@@ -89,16 +93,18 @@ func TestAcquireFailsWithFakeMinority(t *testing.T) {
 }
 
 func TestAcquireFailsWhenElapsedExceedsTTL(t *testing.T) {
+	clients := []redisClient{
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: true, setNXDelay: 50 * time.Millisecond},
+		&fakeRedisClient{setNXResult: true, setNXDelay: 50 * time.Millisecond}}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: true, setNXDelay: 50 * time.Millisecond},
-			&fakeRedisClient{setNXResult: true, setNXDelay: 50 * time.Millisecond},
-		},
-		key: "test",
-		ttl: 10 * time.Millisecond,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     10 * time.Millisecond,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	acquired, token, err := lock.Acquire(context.Background())
@@ -113,20 +119,23 @@ func TestAcquireFailsWhenElapsedExceedsTTL(t *testing.T) {
 	}
 }
 
-func TestAcquireReturnsJoinedErrorWhenMajorityError(t *testing.T) {
+func TestAcquireReturnsJoinedErrorWhenQuorumErrorsOut(t *testing.T) {
 	errA := errors.New("boom-a")
 	errB := errors.New("boom-b")
 	errC := errors.New("boom-c")
+
+	clients := []redisClient{
+		&fakeRedisClient{setNXErr: errA},
+		&fakeRedisClient{setNXErr: errB},
+		&fakeRedisClient{setNXErr: errC},
+		&fakeRedisClient{setNXResult: true},
+		&fakeRedisClient{setNXResult: true}}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{setNXErr: errA},
-			&fakeRedisClient{setNXErr: errB},
-			&fakeRedisClient{setNXErr: errC},
-			&fakeRedisClient{setNXResult: true},
-			&fakeRedisClient{setNXResult: true},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	acquired, _, err := lock.Acquire(context.Background())
@@ -138,17 +147,19 @@ func TestAcquireReturnsJoinedErrorWhenMajorityError(t *testing.T) {
 	}
 }
 
-func TestReleaseSucceedsWithFakeMajority(t *testing.T) {
+func TestReleaseSucceeds(t *testing.T) {
+	clients := []redisClient{
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 0},
+		&fakeRedisClient{evalResult: 0}}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 0},
-			&fakeRedisClient{evalResult: 0},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	released, err := lock.Release(context.Background())
@@ -160,17 +171,20 @@ func TestReleaseSucceedsWithFakeMajority(t *testing.T) {
 	}
 }
 
-func TestReleaseFailsWhenMinorityMatch(t *testing.T) {
+func TestReleaseFails(t *testing.T) {
+	clients := []redisClient{
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 0},
+		&fakeRedisClient{evalResult: 0},
+		&fakeRedisClient{evalResult: 0},
+		&fakeRedisClient{evalResult: 0},
+	}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 0},
-			&fakeRedisClient{evalResult: 0},
-			&fakeRedisClient{evalResult: 0},
-			&fakeRedisClient{evalResult: 0},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	released, err := lock.Release(context.Background())
@@ -182,20 +196,24 @@ func TestReleaseFailsWhenMinorityMatch(t *testing.T) {
 	}
 }
 
-func TestReleaseReturnsJoinedErrorWhenMajorityError(t *testing.T) {
+func TestReleaseReturnsJoinedErrorWhenQuorumErrorsOut(t *testing.T) {
 	errA := errors.New("boom-a")
 	errB := errors.New("boom-b")
 	errC := errors.New("boom-c")
+
+	clients := []redisClient{
+		&fakeRedisClient{evalErr: errA},
+		&fakeRedisClient{evalErr: errB},
+		&fakeRedisClient{evalErr: errC},
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1},
+	}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{evalErr: errA},
-			&fakeRedisClient{evalErr: errB},
-			&fakeRedisClient{evalErr: errC},
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	released, err := lock.Release(context.Background())
@@ -207,17 +225,20 @@ func TestReleaseReturnsJoinedErrorWhenMajorityError(t *testing.T) {
 	}
 }
 
-func TestExtendSucceedsWithFakeMajority(t *testing.T) {
+func TestExtendSucceeds(t *testing.T) {
+	clients := []redisClient{
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 0},
+		&fakeRedisClient{evalResult: 0},
+	}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 0},
-			&fakeRedisClient{evalResult: 0},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	extended, err := lock.Extend(context.Background())
@@ -230,16 +251,19 @@ func TestExtendSucceedsWithFakeMajority(t *testing.T) {
 }
 
 func TestExtendFailsWhenKeyDoesNotExist(t *testing.T) {
+	clients := []redisClient{
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 0},
+		&fakeRedisClient{evalResult: 0},
+		&fakeRedisClient{evalResult: 0},
+		&fakeRedisClient{evalResult: 0},
+	}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 0},
-			&fakeRedisClient{evalResult: 0},
-			&fakeRedisClient{evalResult: 0},
-			&fakeRedisClient{evalResult: 0},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	extended, err := lock.Extend(context.Background())
@@ -252,16 +276,19 @@ func TestExtendFailsWhenKeyDoesNotExist(t *testing.T) {
 }
 
 func TestExtendFailsWhenElapsedExceedsTTL(t *testing.T) {
+	clients := []redisClient{
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1, evalDelay: 50 * time.Millisecond},
+		&fakeRedisClient{evalResult: 1, evalDelay: 50 * time.Millisecond},
+	}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1, evalDelay: 50 * time.Millisecond},
-			&fakeRedisClient{evalResult: 1, evalDelay: 50 * time.Millisecond},
-		},
-		key: "test",
-		ttl: 10 * time.Millisecond,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     10 * time.Millisecond,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	extended, err := lock.Extend(context.Background())
@@ -273,20 +300,24 @@ func TestExtendFailsWhenElapsedExceedsTTL(t *testing.T) {
 	}
 }
 
-func TestExtendReturnsJoinedErrorWhenMajorityError(t *testing.T) {
+func TestExtendReturnsJoinedErrorWhenQuorumErrorsOut(t *testing.T) {
 	errA := errors.New("boom-a")
 	errB := errors.New("boom-b")
 	errC := errors.New("boom-c")
+
+	clients := []redisClient{
+		&fakeRedisClient{evalErr: errA},
+		&fakeRedisClient{evalErr: errB},
+		&fakeRedisClient{evalErr: errC},
+		&fakeRedisClient{evalResult: 1},
+		&fakeRedisClient{evalResult: 1},
+	}
+
 	lock := &Lock{
-		clients: []redisClient{
-			&fakeRedisClient{evalErr: errA},
-			&fakeRedisClient{evalErr: errB},
-			&fakeRedisClient{evalErr: errC},
-			&fakeRedisClient{evalResult: 1},
-			&fakeRedisClient{evalResult: 1},
-		},
-		key: "test",
-		ttl: 5 * time.Second,
+		clients: clients,
+		key:     t.Name(),
+		ttl:     5 * time.Second,
+		quorum:  len(clients)/2 + 1,
 	}
 
 	extended, err := lock.Extend(context.Background())

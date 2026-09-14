@@ -19,6 +19,7 @@ type Lock struct {
 	key     string
 	ttl     time.Duration
 	value   string
+	quorum  int
 }
 
 func (l *Lock) fanOut(op func(redisClient) (bool, error)) (successCount int, errs []error) {
@@ -47,7 +48,7 @@ func New(addrs []string, key string, ttl time.Duration) *Lock {
 	for i, addr := range addrs {
 		clients[i] = redis.NewClient(&redis.Options{Addr: addr})
 	}
-	return &Lock{clients: clients, key: key, ttl: ttl}
+	return &Lock{clients: clients, key: key, ttl: ttl, quorum: len(clients)/2 + 1}
 }
 
 func (l *Lock) Acquire(ctx context.Context) (bool, int64, error) {
@@ -65,13 +66,12 @@ func (l *Lock) Acquire(ctx context.Context) (bool, int64, error) {
 		return client.SetNX(ctx, l.key, l.value, l.ttl).Result()
 	})
 
-	majority := len(l.clients)/2 + 1
-	if len(collectedErrs) >= majority {
+	if len(collectedErrs) >= l.quorum {
 		l.releaseAll(context.Background())
 		return false, 0, errors.Join(collectedErrs...)
 	}
 	elapsed := time.Since(start)
-	acquired := successCount >= majority && elapsed < l.ttl
+	acquired := successCount >= l.quorum && elapsed < l.ttl
 	if !acquired {
 		l.releaseAll(context.Background())
 		return false, 0, nil
@@ -84,16 +84,15 @@ func (l *Lock) Extend(ctx context.Context) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, l.ttl)
 	defer cancel()
 
-	majority := len(l.clients)/2 + 1
 	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
 		res, err := client.Eval(ctx, extendScript, []string{l.key}, l.value, l.ttl.Milliseconds()).Int64()
 		return res == 1, err
 	})
-	if len(collectedErrs) >= majority {
+	if len(collectedErrs) >= l.quorum {
 		return false, errors.Join(collectedErrs...)
 	}
 	elapsed := time.Since(start)
-	return successCount >= majority && elapsed < l.ttl, nil
+	return successCount >= l.quorum && elapsed < l.ttl, nil
 }
 
 func (l *Lock) releaseAll(ctx context.Context) {
@@ -104,13 +103,12 @@ func (l *Lock) releaseAll(ctx context.Context) {
 }
 
 func (l *Lock) Release(ctx context.Context) (bool, error) {
-	majority := len(l.clients)/2 + 1
 	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
 		res, err := client.Eval(ctx, releaseScript, []string{l.key}, l.value).Int64()
 		return res == 1, err
 	})
-	if len(collectedErrs) >= majority {
+	if len(collectedErrs) >= l.quorum {
 		return false, errors.Join(collectedErrs...)
 	}
-	return successCount >= majority, nil
+	return successCount >= l.quorum, nil
 }
