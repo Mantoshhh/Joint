@@ -21,13 +21,42 @@ type Lock struct {
 	value   string
 }
 
-const script string = `
+const releaseScript string = `
 	if redis.call("get", KEYS[1]) == ARGV[1] then
 		return redis.call("del", KEYS[1])
 	else
 		return 0
 	end
 `
+
+const extendScript string = `
+	if redis.call("get", KEYS[1]) == ARGV[1] then
+		return redis.call("pexpire", KEYS[1], ARGV[2])
+	else
+		return 0
+	end
+`
+
+func (l *Lock) fanOut(op func(redisClient) (bool, error)) (successCount int, errs []error) {
+	results := make(chan bool, len(l.clients))
+	errCh := make(chan error, len(l.clients))
+	for _, client := range l.clients {
+		go func() {
+			success, err := op(client)
+			results <- success
+			errCh <- err
+		}()
+	}
+	for i := 0; i < len(l.clients); i++ {
+		if <-results {
+			successCount++
+		}
+		if err := <-errCh; err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return successCount, errs
+}
 
 func New(addrs []string, key string, ttl time.Duration) *Lock {
 	clients := make([]redisClient, len(addrs))
@@ -66,30 +95,26 @@ func (l *Lock) Acquire(ctx context.Context) (bool, int64, error) {
 	return true, time.Now().UnixNano(), nil
 }
 
-func (l *Lock) fanOut(op func(redisClient) (bool, error)) (successCount int, errs []error) {
-	results := make(chan bool, len(l.clients))
-	errCh := make(chan error, len(l.clients))
-	for _, client := range l.clients {
-		go func() {
-			success, err := op(client)
-			results <- success
-			errCh <- err
-		}()
+func (l *Lock) Extend(ctx context.Context) (bool, error) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, l.ttl)
+	defer cancel()
+
+	majority := len(l.clients)/2 + 1
+	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
+		res, err := client.Eval(ctx, extendScript, []string{l.key}, l.value, l.ttl.Milliseconds()).Int64()
+		return res == 1, err
+	})
+	if len(collectedErrs) >= majority {
+		return false, errors.Join(collectedErrs...)
 	}
-	for i := 0; i < len(l.clients); i++ {
-		if <-results {
-			successCount++
-		}
-		if err := <-errCh; err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return successCount, errs
+	elapsed := time.Since(start)
+	return successCount >= majority && elapsed < l.ttl, nil
 }
 
 func (l *Lock) releaseAll(ctx context.Context) {
 	l.fanOut(func(client redisClient) (bool, error) {
-		res, err := client.Eval(ctx, script, []string{l.key}, l.value).Int64()
+		res, err := client.Eval(ctx, releaseScript, []string{l.key}, l.value).Int64()
 		return res == 1, err
 	})
 }
@@ -97,7 +122,7 @@ func (l *Lock) releaseAll(ctx context.Context) {
 func (l *Lock) Release(ctx context.Context) (bool, error) {
 	majority := len(l.clients)/2 + 1
 	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
-		res, err := client.Eval(ctx, script, []string{l.key}, l.value).Int64()
+		res, err := client.Eval(ctx, releaseScript, []string{l.key}, l.value).Int64()
 		return res == 1, err
 	})
 	if len(collectedErrs) >= majority {
