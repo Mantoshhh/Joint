@@ -34,6 +34,30 @@ func TestAcquireRelease(t *testing.T) {
 	})
 }
 
+func TestAcquireThenExtend(t *testing.T) {
+	lock := New(testAddrs()[:1], t.Name(), 5*time.Second)
+	acquired, _, err := lock.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire returned error: %v", err)
+	}
+	if !acquired {
+		t.Fatalf("expected acquired=true, got false")
+	}
+	t.Cleanup(func() {
+		if _, err := lock.Release(context.Background()); err != nil {
+			t.Logf("cleanup: Release failed: %v", err)
+		}
+	})
+
+	extended, err := lock.Extend(context.Background())
+	if err != nil {
+		t.Fatalf("Extend returned error: %v", err)
+	}
+	if !extended {
+		t.Errorf("expected extended=true, got false")
+	}
+}
+
 func TestAcquireFailsWhileHeld(t *testing.T) {
 	holder := New(testAddrs()[:1], t.Name(), 5*time.Second)
 	contender := New(testAddrs()[:1], t.Name(), 5*time.Second)
