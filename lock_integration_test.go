@@ -1,13 +1,25 @@
+//go:build integration
+
 package joint
 
 import (
 	"context"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
 
+func testAddrs() []string {
+	if v := os.Getenv("JOINT_TEST_REDIS_ADDRS"); v != "" {
+		return strings.Split(v, ",")
+	}
+	return []string{"localhost:6379", "localhost:6380",
+		"localhost:6381", "localhost:6382", "localhost:6383"}
+}
+
 func TestAcquireRelease(t *testing.T) {
-	lock := New([]string{"localhost:6379"}, t.Name(), 5*time.Second)
+	lock := New(testAddrs()[:1], t.Name(), 5*time.Second)
 	acquired, _, err := lock.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire returned error: %v", err)
@@ -16,13 +28,15 @@ func TestAcquireRelease(t *testing.T) {
 		t.Errorf("expected acquired=true, got false")
 	}
 	t.Cleanup(func() {
-		lock.Release(context.Background())
+		if _, err := lock.Release(context.Background()); err != nil {
+			t.Logf("cleanup: Release failed: %v", err)
+		}
 	})
 }
 
 func TestAcquireFailsWhileHeld(t *testing.T) {
-	holder := New([]string{"localhost:6379"}, t.Name(), 5*time.Second)
-	contender := New([]string{"localhost:6379"}, t.Name(), 5*time.Second)
+	holder := New(testAddrs()[:1], t.Name(), 5*time.Second)
+	contender := New(testAddrs()[:1], t.Name(), 5*time.Second)
 	holderAcquired, _, err := holder.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire for holder returned error: %v", err)
@@ -38,12 +52,14 @@ func TestAcquireFailsWhileHeld(t *testing.T) {
 		t.Errorf("expected contenderAcquired=false, got true")
 	}
 	t.Cleanup(func() {
-		holder.Release(context.Background())
+		if _, err := holder.Release(context.Background()); err != nil {
+			t.Logf("cleanup: Release failed: %v", err)
+		}
 	})
 }
 
 func TestReleaseWithoutOwnership(t *testing.T) {
-	lock := New([]string{"localhost:6379"}, t.Name(), 5*time.Second)
+	lock := New(testAddrs()[:1], t.Name(), 5*time.Second)
 	released, err := lock.Release(context.Background())
 	if err != nil {
 		t.Fatalf("Release for lock returned error: %v", err)
@@ -54,8 +70,7 @@ func TestReleaseWithoutOwnership(t *testing.T) {
 }
 
 func TestQuorumSucceedsAgainstMinorityContention(t *testing.T) {
-	addrs := []string{"localhost:6379", "localhost:6380",
-		"localhost:6381", "localhost:6382", "localhost:6383"}
+	addrs := testAddrs()
 	contended := New(addrs[:2], t.Name(), 5*time.Second)
 	contendedAcquired, _, err := contended.Acquire(context.Background())
 	if err != nil {
@@ -73,8 +88,12 @@ func TestQuorumSucceedsAgainstMinorityContention(t *testing.T) {
 		t.Errorf("expected mainAcquired=true, got false")
 	}
 	t.Cleanup(func() {
-		contended.Release(context.Background())
-		main.Release(context.Background())
+		if _, err := contended.Release(context.Background()); err != nil {
+			t.Logf("cleanup: contended.Release failed: %v", err)
+		}
+		if _, err := main.Release(context.Background()); err != nil {
+			t.Logf("cleanup: main.Release failed: %v", err)
+		}
 	})
 }
 
@@ -106,8 +125,38 @@ func TestQuorumFailsAgainstMajorityContention(t *testing.T) {
 		t.Errorf("expected checkAcquired=true, got false")
 	}
 	t.Cleanup(func() {
-		contended.Release(context.Background())
-		main.Release(context.Background())
-		check.Release(context.Background())
+		if _, err := contended.Release(context.Background()); err != nil {
+			t.Logf("cleanup: contended.Release failed: %v", err)
+		}
+		if _, err := main.Release(context.Background()); err != nil {
+			t.Logf("cleanup: main.Release failed: %v", err)
+		}
+		if _, err := check.Release(context.Background()); err != nil {
+			t.Logf("cleanup: check.Release failed: %v", err)
+		}
 	})
+}
+
+func TestFencingTokenIncreasesAcrossAcquisitions(t *testing.T) {
+	addrs := testAddrs()[:1]
+	lock := New(addrs, t.Name(), 5*time.Second)
+	_, token1, err := lock.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("first Acquire returned error: %v", err)
+	}
+	if _, err := lock.Release(context.Background()); err != nil {
+		t.Fatalf("Release between acquisitions returned error: %v", err)
+	}
+	_, token2, err := lock.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("second Acquire returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := lock.Release(context.Background()); err != nil {
+			t.Logf("cleanup: Release failed: %v", err)
+		}
+	})
+	if token2 <= token1 {
+		t.Errorf("expected token2 > token1, got token1=%d, token2=%d", token1, token2)
+	}
 }

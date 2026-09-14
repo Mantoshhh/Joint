@@ -9,8 +9,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+type redisClient interface {
+	SetNX(ctx context.Context, key string, value interface{}, ttl time.Duration) *redis.BoolCmd
+	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
+}
+
 type Lock struct {
-	clients []*redis.Client
+	clients []redisClient
 	key     string
 	ttl     time.Duration
 	value   string
@@ -25,7 +30,7 @@ const script string = `
 `
 
 func New(addrs []string, key string, ttl time.Duration) *Lock {
-	clients := make([]*redis.Client, len(addrs))
+	clients := make([]redisClient, len(addrs))
 	for i, addr := range addrs {
 		clients[i] = redis.NewClient(&redis.Options{Addr: addr})
 	}
@@ -43,7 +48,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, l.ttl)
 	defer cancel()
 
-	successCount, collectedErrs := l.fanOut(func(client *redis.Client) (bool, error) {
+	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
 		return client.SetNX(ctx, l.key, l.value, l.ttl).Result()
 	})
 
@@ -61,7 +66,7 @@ func (l *Lock) Acquire(ctx context.Context) (bool, int64, error) {
 	return true, time.Now().UnixNano(), nil
 }
 
-func (l *Lock) fanOut(op func(*redis.Client) (bool, error)) (successCount int, errs []error) {
+func (l *Lock) fanOut(op func(redisClient) (bool, error)) (successCount int, errs []error) {
 	results := make(chan bool, len(l.clients))
 	errCh := make(chan error, len(l.clients))
 	for _, client := range l.clients {
@@ -83,7 +88,7 @@ func (l *Lock) fanOut(op func(*redis.Client) (bool, error)) (successCount int, e
 }
 
 func (l *Lock) releaseAll(ctx context.Context) {
-	l.fanOut(func(client *redis.Client) (bool, error) {
+	l.fanOut(func(client redisClient) (bool, error) {
 		res, err := client.Eval(ctx, script, []string{l.key}, l.value).Int64()
 		return res == 1, err
 	})
@@ -91,7 +96,7 @@ func (l *Lock) releaseAll(ctx context.Context) {
 
 func (l *Lock) Release(ctx context.Context) (bool, error) {
 	majority := len(l.clients)/2 + 1
-	successCount, collectedErrs := l.fanOut(func(client *redis.Client) (bool, error) {
+	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
 		res, err := client.Eval(ctx, script, []string{l.key}, l.value).Int64()
 		return res == 1, err
 	})
