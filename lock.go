@@ -10,13 +10,19 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type redisClient interface {
+type redlockClient interface {
 	SetNX(ctx context.Context, key string, value interface{}, ttl time.Duration) *redis.BoolCmd
 	Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd
 }
 
+type counterClient interface {
+	Incr(ctx context.Context, key string) *redis.IntCmd
+	Wait(ctx context.Context, numReplicas int, timeout time.Duration) *redis.IntCmd
+}
+
 type Lock struct {
-	clients     []redisClient
+	clients     []redlockClient
+	counter     counterClient
 	key         string
 	ttl         time.Duration
 	value       string
@@ -27,8 +33,14 @@ type Lock struct {
 
 type Option func(*Lock)
 
+// newUUID is a seam over uuid.NewRandom so tests can inject a failure.
+var newUUID = uuid.NewRandom
+
+var ErrNoCounter = errors.New("joint: no counter configured")
+var ErrNoAck = errors.New("joint: no counter ack")
+
 func New(addrs []string, key string, ttl time.Duration, opts ...Option) *Lock {
-	clients := make([]redisClient, len(addrs))
+	clients := make([]redlockClient, len(addrs))
 	for i, addr := range addrs {
 		clients[i] = redis.NewClient(&redis.Options{Addr: addr})
 	}
@@ -104,13 +116,22 @@ func WithRetry(maxAttempts int, baseDelay time.Duration) Option {
 	}
 }
 
+func WithCounter(masterName string, sentinelAddrs []string) Option {
+	return func(l *Lock) {
+		l.counter = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    masterName,
+			SentinelAddrs: sentinelAddrs,
+		})
+	}
+}
+
 func backoffWithJitter(base time.Duration, attempt int) time.Duration {
 	exp := base * time.Duration(1<<attempt)
 	half := exp / 2
 	return half + time.Duration(rand.Int63n(int64(half)+1))
 }
 
-func (l *Lock) fanOut(op func(redisClient) (bool, error)) (successCount int, errs []error) {
+func (l *Lock) fanOut(op func(redlockClient) (bool, error)) (successCount int, errs []error) {
 	results := make(chan bool, len(l.clients))
 	errCh := make(chan error, len(l.clients))
 	for _, client := range l.clients {
@@ -132,14 +153,14 @@ func (l *Lock) fanOut(op func(redisClient) (bool, error)) (successCount int, err
 }
 
 func (l *Lock) releaseAll(ctx context.Context) {
-	l.fanOut(func(client redisClient) (bool, error) {
+	l.fanOut(func(client redlockClient) (bool, error) {
 		res, err := client.Eval(ctx, releaseScript, []string{l.key}, l.value).Int64()
 		return res == 1, err
 	})
 }
 
 func (l *Lock) tryAcquire(ctx context.Context) (bool, int64, error) {
-	id, err := uuid.NewRandom()
+	id, err := newUUID()
 	if err != nil {
 		return false, 0, err
 	}
@@ -149,7 +170,7 @@ func (l *Lock) tryAcquire(ctx context.Context) (bool, int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, l.ttl)
 	defer cancel()
 
-	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
+	successCount, collectedErrs := l.fanOut(func(client redlockClient) (bool, error) {
 		return client.SetNX(ctx, l.key, l.value, l.ttl).Result()
 	})
 
@@ -163,7 +184,33 @@ func (l *Lock) tryAcquire(ctx context.Context) (bool, int64, error) {
 		l.releaseAll(context.Background())
 		return false, 0, nil
 	}
-	return true, time.Now().UnixNano(), nil
+	token, err := l.nextToken(ctx)
+	if err != nil {
+		return false, 0, err
+	}
+	return true, token, nil
+}
+
+func (l *Lock) nextToken(ctx context.Context) (int64, error) {
+	if l.counter == nil {
+		l.releaseAll(context.Background())
+		return 0, ErrNoCounter
+	}
+	token, err := l.counter.Incr(ctx, l.key).Result()
+	if err != nil {
+		l.releaseAll(context.Background())
+		return 0, err
+	}
+	acked, err := l.counter.Wait(ctx, 1, 200*time.Millisecond).Result()
+	if err != nil {
+		l.releaseAll(context.Background())
+		return 0, err
+	}
+	if acked < 1 {
+		l.releaseAll(context.Background())
+		return 0, ErrNoAck
+	}
+	return token, nil
 }
 
 func (l *Lock) tryExtend(ctx context.Context) (bool, error) {
@@ -171,7 +218,7 @@ func (l *Lock) tryExtend(ctx context.Context) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, l.ttl)
 	defer cancel()
 
-	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
+	successCount, collectedErrs := l.fanOut(func(client redlockClient) (bool, error) {
 		res, err := client.Eval(ctx, extendScript, []string{l.key}, l.value, l.ttl.Milliseconds()).Int64()
 		return res == 1, err
 	})
@@ -183,7 +230,7 @@ func (l *Lock) tryExtend(ctx context.Context) (bool, error) {
 }
 
 func (l *Lock) tryRelease(ctx context.Context) (bool, error) {
-	successCount, collectedErrs := l.fanOut(func(client redisClient) (bool, error) {
+	successCount, collectedErrs := l.fanOut(func(client redlockClient) (bool, error) {
 		res, err := client.Eval(ctx, releaseScript, []string{l.key}, l.value).Int64()
 		return res == 1, err
 	})
