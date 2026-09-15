@@ -6,21 +6,19 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/Mantoshhh/Joint)](https://goreportcard.com/report/github.com/Mantoshhh/Joint)
 [![License](https://img.shields.io/github/license/Mantoshhh/Joint)](LICENSE)
 
-A Redis-backed distributed lock for Go, implementing the Redlock algorithm — **with fencing tokens**, which the most widely-used Go Redlock library does not provide.
+A Redis-backed distributed lock for Go, implementing the Redlock algorithm **with fencing tokens**, which the most widely-used Go Redlock library does not provide.
 
-Joint is an embedded client library, not a standalone lock service — each process that needs the lock imports the package and talks to Redis directly, avoiding an extra network hop through a middleman.
+Joint is an embedded client library, not a standalone lock service. Each process that needs the lock imports the package and talks to Redis directly, avoiding an extra network hop through a middleman.
 
 ## Why fencing tokens matter
 
-Redlock's mutual exclusion alone doesn't protect a resource from a client that acquired the lock, stalled (GC pause, slow network, descheduled process) past its TTL, and resumed after another client already took over — both clients can end up believing they hold the lock at once. Martin Kleppmann's well-known critique of Redlock ("[How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)") identifies fencing tokens as the actual fix: a monotonically increasing number, handed out on every successful acquisition, that the *protected resource* checks and uses to reject any write carrying a token older than one it's already seen.
-
-`redsync`, the most popular Go Redlock implementation, does not implement this — confirmed by reading its source directly: it generates a random value purely to make release safe, with no counter or sequence number involved. Joint does implement it (see [Design](#design) below), so the specific gap Kleppmann's post identifies is actually closed here, not just mutual exclusion.
+Redlock's mutual exclusion alone doesn't protect a resource from a client that acquired the lock, stalled (GC pause, slow network, de-scheduled process) past its TTL, and resumed after another client already took over. Both clients can end up believing they hold the lock at once. Martin Kleppmann's well-known critique of Redlock ("[How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)") identifies fencing tokens as the actual fix: a monotonically increasing number, handed out on every successful acquisition, that the *protected resource* checks and uses to reject any write carrying a token older than one it's already seen.
 
 ## Design
 
 - **Lock primitive**: `SET key value NX PX ttl` against each Redis instance, with a Lua script (`GET` + conditional `DEL`) for safe release, so a client can never delete a lock it no longer owns.
-- **Replication**: true Redlock — 5 independent Redis masters, no replication between them. Acquiring the lock requires a majority (3 of 5), computed within a timing budget derived from the lock's TTL, so a slow or partially unreachable quorum can't succeed after the lock would already be considered expired. A failed acquisition releases whatever it managed to acquire on all 5 instances.
-- **Fencing tokens**: every successful `Acquire` returns a monotonically increasing token (a nanosecond timestamp), which a protected resource can use to reject writes from a client that held the lock, stalled past its TTL, and resumed after someone else took over. Enforcing this is the caller's responsibility — the lock only supplies the token.
+- **Replication**: true Redlock, 5 independent Redis masters, no replication between them. Acquiring the lock requires a majority (3 of 5), computed within a timing budget derived from the lock's TTL, so a slow or partially unreachable quorum can't succeed after the lock would already be considered expired. A failed acquisition releases whatever it managed to acquire on all 5 instances.
+- **Fencing tokens**: every successful `Acquire` returns a monotonically increasing token (a nanosecond timestamp), which a protected resource can use to reject writes from a client that held the lock, stalled past its TTL, and resumed after someone else took over. Enforcing this is the caller's responsibility, the lock only supplies the token.
 
 ## Install
 
