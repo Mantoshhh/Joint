@@ -7,27 +7,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      redis1:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-      redis2:
-        image: redis:7-alpine
-        ports:
-          - 6380:6379
-      redis3:
-        image: redis:7-alpine
-        ports:
-          - 6381:6379
-      redis4:
-        image: redis:7-alpine
-        ports:
-          - 6382:6379
-      redis5:
-        image: redis:7-alpine
-        ports:
-          - 6383:6379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -35,4 +14,6 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./... -race -tags=integration
+      - run: docker compose --profile integration run --rm tests go test ./... -race -tags=integration
+      - if: always()
+        run: docker compose down -v

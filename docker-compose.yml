@@ -1,26 +1,102 @@
 services:
-  redis1:
+  redlock-1:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     restart: unless-stopped
-  redis2:
+  redlock-2:
     image: redis:7-alpine
     ports:
       - "6380:6379"
     restart: unless-stopped
-  redis3:
+  redlock-3:
     image: redis:7-alpine
     ports:
       - "6381:6379"
     restart: unless-stopped
-  redis4:
+  redlock-4:
     image: redis:7-alpine
     ports:
       - "6382:6379"
     restart: unless-stopped
-  redis5:
+  redlock-5:
     image: redis:7-alpine
     ports:
       - "6383:6379"
     restart: unless-stopped
+  counter-primary:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6384:6379"
+    volumes:
+      - counter-primary-data:/data
+    restart: unless-stopped
+  counter-replica:
+    image: redis:7-alpine
+    command: redis-server --replicaof counter-primary 6379 --appendonly yes
+    ports:
+      - "6385:6379"
+    volumes:
+      - counter-replica-data:/data
+    restart: unless-stopped
+    depends_on:
+      - counter-primary
+  counter-sentinel-1:
+    image: redis:7-alpine
+    command: redis-sentinel /etc/redis/sentinel.conf
+    ports:
+      - "6386:26379"
+    volumes:
+      - ./sentinel/sentinel-1.conf:/etc/redis/sentinel.conf
+    restart: unless-stopped
+    depends_on:
+      - counter-primary
+      - counter-replica
+  counter-sentinel-2:
+    image: redis:7-alpine
+    command: redis-sentinel /etc/redis/sentinel.conf
+    ports:
+      - "6387:26379"
+    volumes:
+      - ./sentinel/sentinel-2.conf:/etc/redis/sentinel.conf
+    restart: unless-stopped
+    depends_on:
+      - counter-primary
+      - counter-replica
+  counter-sentinel-3:
+    image: redis:7-alpine
+    command: redis-sentinel /etc/redis/sentinel.conf
+    ports:
+      - "6388:26379"
+    volumes:
+      - ./sentinel/sentinel-3.conf:/etc/redis/sentinel.conf
+    restart: unless-stopped
+    depends_on:
+      - counter-primary
+      - counter-replica
+  tests:
+    image: golang:1.26
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      JOINT_TEST_REDIS_ADDRS: redlock-1:6379,redlock-2:6379,redlock-3:6379,redlock-4:6379,redlock-5:6379
+      JOINT_TEST_SENTINEL_ADDRS: counter-sentinel-1:26379,counter-sentinel-2:26379,counter-sentinel-3:26379
+    command: go test -tags integration ./...
+    depends_on:
+      - redlock-1
+      - redlock-2
+      - redlock-3
+      - redlock-4
+      - redlock-5
+      - counter-primary
+      - counter-replica
+      - counter-sentinel-1
+      - counter-sentinel-2
+      - counter-sentinel-3
+    profiles:
+      - integration
+volumes:
+  counter-primary-data:
+  counter-replica-data:

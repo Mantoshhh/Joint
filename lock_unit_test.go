@@ -6,10 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
-type fakeRedisClient struct {
+type fakeRedlockClient struct {
 	setNXResult bool
 	setNXErr    error
 	setNXDelay  time.Duration
@@ -29,7 +30,7 @@ type fakeRedisClient struct {
 	evalCalls    int
 }
 
-func (f *fakeRedisClient) SetNX(ctx context.Context, key string, value interface{}, ttl time.Duration) *redis.BoolCmd {
+func (f *fakeRedlockClient) SetNX(ctx context.Context, key string, value interface{}, ttl time.Duration) *redis.BoolCmd {
 	f.setNXCalls++
 	if f.setNXDelay > 0 {
 		time.Sleep(f.setNXDelay)
@@ -44,7 +45,7 @@ func (f *fakeRedisClient) SetNX(ctx context.Context, key string, value interface
 	return cmd
 }
 
-func (f *fakeRedisClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd {
+func (f *fakeRedlockClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd {
 	f.evalCalls++
 	if f.evalDelay > 0 {
 		time.Sleep(f.evalDelay)
@@ -59,6 +60,31 @@ func (f *fakeRedisClient) Eval(ctx context.Context, script string, keys []string
 	return cmd
 }
 
+type fakeCounterClient struct {
+	incrResult int64
+	incrErr    error
+	waitResult int64
+	waitErr    error
+	incrCalls  int
+	waitCalls  int
+}
+
+func (f *fakeCounterClient) Incr(ctx context.Context, key string) *redis.IntCmd {
+	f.incrCalls++
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(f.incrResult)
+	cmd.SetErr(f.incrErr)
+	return cmd
+}
+
+func (f *fakeCounterClient) Wait(ctx context.Context, numReplicas int, timeout time.Duration) *redis.IntCmd {
+	f.waitCalls++
+	cmd := redis.NewIntCmd(ctx)
+	cmd.SetVal(f.waitResult)
+	cmd.SetErr(f.waitErr)
+	return cmd
+}
+
 // lockOp normalizes Acquire/Extend/Release to the same (bool, error) shape
 // so retry-loop behavior can be tested once, across all three, via a table.
 // attemptCalls reads whichever counter actually corresponds to "one attempt"
@@ -68,32 +94,33 @@ func (f *fakeRedisClient) Eval(ctx context.Context, script string, keys []string
 type lockOp struct {
 	name         string
 	call         func(l *Lock, ctx context.Context) (bool, error)
-	attemptCalls func(f *fakeRedisClient) int
+	attemptCalls func(f *fakeRedlockClient) int
 }
 
 var lockOps = []lockOp{
 	{"Acquire", func(l *Lock, ctx context.Context) (bool, error) {
 		acquired, _, err := l.Acquire(ctx)
 		return acquired, err
-	}, func(f *fakeRedisClient) int { return f.setNXCalls }},
+	}, func(f *fakeRedlockClient) int { return f.setNXCalls }},
 	{"Extend", func(l *Lock, ctx context.Context) (bool, error) {
 		return l.Extend(ctx)
-	}, func(f *fakeRedisClient) int { return f.evalCalls }},
+	}, func(f *fakeRedlockClient) int { return f.evalCalls }},
 	{"Release", func(l *Lock, ctx context.Context) (bool, error) {
 		return l.Release(ctx)
-	}, func(f *fakeRedisClient) int { return f.evalCalls }},
+	}, func(f *fakeRedlockClient) int { return f.evalCalls }},
 }
 
 func TestAcquireSucceeds(t *testing.T) {
-	clients := []redisClient{
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: false},
-		&fakeRedisClient{setNXResult: false}}
+	clients := []redlockClient{
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: false},
+		&fakeRedlockClient{setNXResult: false}}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -113,15 +140,16 @@ func TestAcquireSucceeds(t *testing.T) {
 }
 
 func TestAcquireFails(t *testing.T) {
-	clients := []redisClient{
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: false},
-		&fakeRedisClient{setNXResult: false},
-		&fakeRedisClient{setNXResult: false}}
+	clients := []redlockClient{
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: false},
+		&fakeRedlockClient{setNXResult: false},
+		&fakeRedlockClient{setNXResult: false}}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -141,15 +169,16 @@ func TestAcquireFails(t *testing.T) {
 }
 
 func TestAcquireFailsWhenElapsedExceedsTTL(t *testing.T) {
-	clients := []redisClient{
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: true, setNXDelay: 50 * time.Millisecond},
-		&fakeRedisClient{setNXResult: true, setNXDelay: 50 * time.Millisecond}}
+	clients := []redlockClient{
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: true, setNXDelay: 50 * time.Millisecond},
+		&fakeRedlockClient{setNXResult: true, setNXDelay: 50 * time.Millisecond}}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         10 * time.Millisecond,
 		quorum:      len(clients)/2 + 1,
@@ -173,15 +202,16 @@ func TestAcquireReturnsJoinedErrorWhenQuorumErrorsOut(t *testing.T) {
 	errB := errors.New("boom-b")
 	errC := errors.New("boom-c")
 
-	clients := []redisClient{
-		&fakeRedisClient{setNXErr: errA},
-		&fakeRedisClient{setNXErr: errB},
-		&fakeRedisClient{setNXErr: errC},
-		&fakeRedisClient{setNXResult: true},
-		&fakeRedisClient{setNXResult: true}}
+	clients := []redlockClient{
+		&fakeRedlockClient{setNXErr: errA},
+		&fakeRedlockClient{setNXErr: errB},
+		&fakeRedlockClient{setNXErr: errC},
+		&fakeRedlockClient{setNXResult: true},
+		&fakeRedlockClient{setNXResult: true}}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -198,15 +228,16 @@ func TestAcquireReturnsJoinedErrorWhenQuorumErrorsOut(t *testing.T) {
 }
 
 func TestReleaseSucceeds(t *testing.T) {
-	clients := []redisClient{
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 0},
-		&fakeRedisClient{evalResult: 0}}
+	clients := []redlockClient{
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 0},
+		&fakeRedlockClient{evalResult: 0}}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -223,16 +254,17 @@ func TestReleaseSucceeds(t *testing.T) {
 }
 
 func TestReleaseFails(t *testing.T) {
-	clients := []redisClient{
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 0},
-		&fakeRedisClient{evalResult: 0},
-		&fakeRedisClient{evalResult: 0},
-		&fakeRedisClient{evalResult: 0},
+	clients := []redlockClient{
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 0},
+		&fakeRedlockClient{evalResult: 0},
+		&fakeRedlockClient{evalResult: 0},
+		&fakeRedlockClient{evalResult: 0},
 	}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -253,16 +285,17 @@ func TestReleaseReturnsJoinedErrorWhenQuorumErrorsOut(t *testing.T) {
 	errB := errors.New("boom-b")
 	errC := errors.New("boom-c")
 
-	clients := []redisClient{
-		&fakeRedisClient{evalErr: errA},
-		&fakeRedisClient{evalErr: errB},
-		&fakeRedisClient{evalErr: errC},
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1},
+	clients := []redlockClient{
+		&fakeRedlockClient{evalErr: errA},
+		&fakeRedlockClient{evalErr: errB},
+		&fakeRedlockClient{evalErr: errC},
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1},
 	}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -279,16 +312,17 @@ func TestReleaseReturnsJoinedErrorWhenQuorumErrorsOut(t *testing.T) {
 }
 
 func TestExtendSucceeds(t *testing.T) {
-	clients := []redisClient{
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 0},
-		&fakeRedisClient{evalResult: 0},
+	clients := []redlockClient{
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 0},
+		&fakeRedlockClient{evalResult: 0},
 	}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -305,16 +339,17 @@ func TestExtendSucceeds(t *testing.T) {
 }
 
 func TestExtendFailsWhenKeyDoesNotExist(t *testing.T) {
-	clients := []redisClient{
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 0},
-		&fakeRedisClient{evalResult: 0},
-		&fakeRedisClient{evalResult: 0},
-		&fakeRedisClient{evalResult: 0},
+	clients := []redlockClient{
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 0},
+		&fakeRedlockClient{evalResult: 0},
+		&fakeRedlockClient{evalResult: 0},
+		&fakeRedlockClient{evalResult: 0},
 	}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -331,16 +366,17 @@ func TestExtendFailsWhenKeyDoesNotExist(t *testing.T) {
 }
 
 func TestExtendFailsWhenElapsedExceedsTTL(t *testing.T) {
-	clients := []redisClient{
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1, evalDelay: 50 * time.Millisecond},
-		&fakeRedisClient{evalResult: 1, evalDelay: 50 * time.Millisecond},
+	clients := []redlockClient{
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1, evalDelay: 50 * time.Millisecond},
+		&fakeRedlockClient{evalResult: 1, evalDelay: 50 * time.Millisecond},
 	}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         10 * time.Millisecond,
 		quorum:      len(clients)/2 + 1,
@@ -361,16 +397,17 @@ func TestExtendReturnsJoinedErrorWhenQuorumErrorsOut(t *testing.T) {
 	errB := errors.New("boom-b")
 	errC := errors.New("boom-c")
 
-	clients := []redisClient{
-		&fakeRedisClient{evalErr: errA},
-		&fakeRedisClient{evalErr: errB},
-		&fakeRedisClient{evalErr: errC},
-		&fakeRedisClient{evalResult: 1},
-		&fakeRedisClient{evalResult: 1},
+	clients := []redlockClient{
+		&fakeRedlockClient{evalErr: errA},
+		&fakeRedlockClient{evalErr: errB},
+		&fakeRedlockClient{evalErr: errC},
+		&fakeRedlockClient{evalResult: 1},
+		&fakeRedlockClient{evalResult: 1},
 	}
 
 	lock := &Lock{
 		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 		key:         t.Name(),
 		ttl:         5 * time.Second,
 		quorum:      len(clients)/2 + 1,
@@ -390,15 +427,16 @@ func TestRetryRecoversFromTransientError(t *testing.T) {
 	for _, op := range lockOps {
 		t.Run(op.name, func(t *testing.T) {
 			transientErr := errors.New("transient")
-			clients := []redisClient{
-				&fakeRedisClient{setNXResult: true, evalResult: 1, failFirst: 1, transientErr: transientErr},
-				&fakeRedisClient{setNXResult: true, evalResult: 1, failFirst: 1, transientErr: transientErr},
-				&fakeRedisClient{setNXResult: true, evalResult: 1, failFirst: 1, transientErr: transientErr},
-				&fakeRedisClient{setNXResult: true, evalResult: 1},
-				&fakeRedisClient{setNXResult: true, evalResult: 1},
+			clients := []redlockClient{
+				&fakeRedlockClient{setNXResult: true, evalResult: 1, failFirst: 1, transientErr: transientErr},
+				&fakeRedlockClient{setNXResult: true, evalResult: 1, failFirst: 1, transientErr: transientErr},
+				&fakeRedlockClient{setNXResult: true, evalResult: 1, failFirst: 1, transientErr: transientErr},
+				&fakeRedlockClient{setNXResult: true, evalResult: 1},
+				&fakeRedlockClient{setNXResult: true, evalResult: 1},
 			}
 			lock := &Lock{
 				clients:     clients,
+				counter:     &fakeCounterClient{incrResult: 1, waitResult: 1},
 				key:         t.Name(),
 				ttl:         5 * time.Second,
 				quorum:      len(clients)/2 + 1,
@@ -421,15 +459,15 @@ func TestRetryExhaustsAttemptsAndReturnsLastError(t *testing.T) {
 	for _, op := range lockOps {
 		t.Run(op.name, func(t *testing.T) {
 			transientErr := errors.New("always transient")
-			erroring := []*fakeRedisClient{
+			erroring := []*fakeRedlockClient{
 				{setNXErr: transientErr, evalErr: transientErr},
 				{setNXErr: transientErr, evalErr: transientErr},
 				{setNXErr: transientErr, evalErr: transientErr},
 			}
-			clients := []redisClient{
+			clients := []redlockClient{
 				erroring[0], erroring[1], erroring[2],
-				&fakeRedisClient{setNXResult: true, evalResult: 1},
-				&fakeRedisClient{setNXResult: true, evalResult: 1},
+				&fakeRedlockClient{setNXResult: true, evalResult: 1},
+				&fakeRedlockClient{setNXResult: true, evalResult: 1},
 			}
 			lock := &Lock{
 				clients:     clients,
@@ -459,14 +497,14 @@ func TestRetryExhaustsAttemptsAndReturnsLastError(t *testing.T) {
 func TestRetryDoesNotRetryOnCleanFailure(t *testing.T) {
 	for _, op := range lockOps {
 		t.Run(op.name, func(t *testing.T) {
-			fakes := []*fakeRedisClient{
+			fakes := []*fakeRedlockClient{
 				{setNXResult: false, evalResult: 0},
 				{setNXResult: false, evalResult: 0},
 				{setNXResult: false, evalResult: 0},
 				{setNXResult: false, evalResult: 0},
 				{setNXResult: false, evalResult: 0},
 			}
-			clients := make([]redisClient, len(fakes))
+			clients := make([]redlockClient, len(fakes))
 			for i, f := range fakes {
 				clients[i] = f
 			}
@@ -499,12 +537,12 @@ func TestRetryRespectsContextCancellation(t *testing.T) {
 	for _, op := range lockOps {
 		t.Run(op.name, func(t *testing.T) {
 			transientErr := errors.New("always transient")
-			clients := []redisClient{
-				&fakeRedisClient{setNXErr: transientErr, evalErr: transientErr},
-				&fakeRedisClient{setNXErr: transientErr, evalErr: transientErr},
-				&fakeRedisClient{setNXErr: transientErr, evalErr: transientErr},
-				&fakeRedisClient{setNXErr: transientErr, evalErr: transientErr},
-				&fakeRedisClient{setNXErr: transientErr, evalErr: transientErr},
+			clients := []redlockClient{
+				&fakeRedlockClient{setNXErr: transientErr, evalErr: transientErr},
+				&fakeRedlockClient{setNXErr: transientErr, evalErr: transientErr},
+				&fakeRedlockClient{setNXErr: transientErr, evalErr: transientErr},
+				&fakeRedlockClient{setNXErr: transientErr, evalErr: transientErr},
+				&fakeRedlockClient{setNXErr: transientErr, evalErr: transientErr},
 			}
 			lock := &Lock{
 				clients:     clients,
@@ -529,6 +567,255 @@ func TestRetryRespectsContextCancellation(t *testing.T) {
 				t.Errorf("expected early return on context cancellation, took %v", elapsed)
 			}
 		})
+	}
+}
+
+func TestNextTokenNoCounter(t *testing.T) {
+	lock := &Lock{key: t.Name()}
+
+	token, err := lock.nextToken(context.Background())
+	if !errors.Is(err, ErrNoCounter) {
+		t.Errorf("expected ErrNoCounter, got %v", err)
+	}
+	if token != 0 {
+		t.Errorf("expected token=0, got %d", token)
+	}
+}
+
+func TestNextTokenNoCounterReleasesRedlockGrant(t *testing.T) {
+	fakes := []*fakeRedlockClient{{evalResult: 1}, {evalResult: 1}, {evalResult: 1}}
+	clients := make([]redlockClient, len(fakes))
+	for i, f := range fakes {
+		clients[i] = f
+	}
+	lock := &Lock{clients: clients, key: t.Name(), quorum: 2}
+
+	if _, err := lock.nextToken(context.Background()); !errors.Is(err, ErrNoCounter) {
+		t.Fatalf("expected ErrNoCounter, got %v", err)
+	}
+	for i, f := range fakes {
+		if f.evalCalls != 1 {
+			t.Errorf("fake[%d] evalCalls = %d, want 1 (expected releaseAll on missing counter)", i, f.evalCalls)
+		}
+	}
+}
+
+func TestNextTokenIncrError(t *testing.T) {
+	incrErr := errors.New("incr boom")
+	fakes := []*fakeRedlockClient{{evalResult: 1}, {evalResult: 1}, {evalResult: 1}}
+	clients := make([]redlockClient, len(fakes))
+	for i, f := range fakes {
+		clients[i] = f
+	}
+	lock := &Lock{
+		clients: clients,
+		counter: &fakeCounterClient{incrErr: incrErr},
+		key:     t.Name(),
+		quorum:  2,
+	}
+
+	token, err := lock.nextToken(context.Background())
+	if !errors.Is(err, incrErr) {
+		t.Errorf("expected incrErr, got %v", err)
+	}
+	if token != 0 {
+		t.Errorf("expected token=0, got %d", token)
+	}
+	for i, f := range fakes {
+		if f.evalCalls != 1 {
+			t.Errorf("fake[%d] evalCalls = %d, want 1 (expected releaseAll on Incr error)", i, f.evalCalls)
+		}
+	}
+}
+
+func TestNextTokenWaitError(t *testing.T) {
+	waitErr := errors.New("wait boom")
+	counter := &fakeCounterClient{incrResult: 42, waitErr: waitErr}
+	lock := &Lock{counter: counter, key: t.Name(), quorum: 1}
+
+	token, err := lock.nextToken(context.Background())
+	if !errors.Is(err, waitErr) {
+		t.Errorf("expected waitErr, got %v", err)
+	}
+	if token != 0 {
+		t.Errorf("expected token=0, got %d", token)
+	}
+	if counter.incrCalls != 1 || counter.waitCalls != 1 {
+		t.Errorf("expected exactly one Incr call and one Wait call, got incr=%d wait=%d", counter.incrCalls, counter.waitCalls)
+	}
+}
+
+func TestNextTokenInsufficientAck(t *testing.T) {
+	counter := &fakeCounterClient{incrResult: 42, waitResult: 0}
+	lock := &Lock{counter: counter, key: t.Name(), quorum: 1}
+
+	token, err := lock.nextToken(context.Background())
+	if !errors.Is(err, ErrNoAck) {
+		t.Errorf("expected ErrNoAck, got %v", err)
+	}
+	if token != 0 {
+		t.Errorf("expected token=0, got %d", token)
+	}
+}
+
+func TestNextTokenSuccess(t *testing.T) {
+	counter := &fakeCounterClient{incrResult: 7, waitResult: 1}
+	lock := &Lock{counter: counter, key: t.Name()}
+
+	token, err := lock.nextToken(context.Background())
+	if err != nil {
+		t.Fatalf("nextToken returned error: %v", err)
+	}
+	if token != 7 {
+		t.Errorf("expected token=7, got %d", token)
+	}
+}
+
+func TestWithRetrySetsFields(t *testing.T) {
+	lock := New([]string{"localhost:6379"}, t.Name(), 5*time.Second,
+		WithRetry(4, 25*time.Millisecond))
+
+	if lock.maxAttempts != 4 {
+		t.Errorf("expected maxAttempts=4, got %d", lock.maxAttempts)
+	}
+	if lock.baseDelay != 25*time.Millisecond {
+		t.Errorf("expected baseDelay=25ms, got %v", lock.baseDelay)
+	}
+}
+
+func TestWithCounterSetsCounter(t *testing.T) {
+	lock := New([]string{"localhost:6379"}, t.Name(), 5*time.Second,
+		WithCounter("mymaster", []string{"localhost:26379"}))
+
+	if lock.counter == nil {
+		t.Errorf("expected WithCounter to set a non-nil counter")
+	}
+}
+
+func TestAcquireFailsClosedWithoutCounter(t *testing.T) {
+	clients := []redlockClient{
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+		&fakeRedlockClient{setNXResult: false, evalResult: 1},
+		&fakeRedlockClient{setNXResult: false, evalResult: 1},
+	}
+	lock := &Lock{
+		clients:     clients,
+		key:         t.Name(),
+		ttl:         5 * time.Second,
+		quorum:      len(clients)/2 + 1,
+		maxAttempts: 1,
+	}
+
+	acquired, token, err := lock.Acquire(context.Background())
+	if acquired {
+		t.Errorf("expected acquired=false without a counter configured, got true")
+	}
+	if !errors.Is(err, ErrNoCounter) {
+		t.Errorf("expected ErrNoCounter, got %v", err)
+	}
+	if token != 0 {
+		t.Errorf("expected token=0, got %d", token)
+	}
+}
+
+func TestAcquireReturnsCounterToken(t *testing.T) {
+	clients := []redlockClient{
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+		&fakeRedlockClient{setNXResult: false, evalResult: 1},
+		&fakeRedlockClient{setNXResult: false, evalResult: 1},
+	}
+	lock := &Lock{
+		clients:     clients,
+		counter:     &fakeCounterClient{incrResult: 99, waitResult: 1},
+		key:         t.Name(),
+		ttl:         5 * time.Second,
+		quorum:      len(clients)/2 + 1,
+		maxAttempts: 1,
+	}
+
+	acquired, token, err := lock.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("Acquire returned error: %v", err)
+	}
+	if !acquired {
+		t.Errorf("expected acquired=true, got false")
+	}
+	if token != 99 {
+		t.Errorf("expected token=99 (from counter), got %d", token)
+	}
+}
+
+func TestAcquireReleasesRedlockGrantWhenCounterFails(t *testing.T) {
+	incrErr := errors.New("counter unreachable")
+	fakes := []*fakeRedlockClient{
+		{setNXResult: true, evalResult: 1},
+		{setNXResult: true, evalResult: 1},
+		{setNXResult: true, evalResult: 1},
+		{setNXResult: false, evalResult: 1},
+		{setNXResult: false, evalResult: 1},
+	}
+	clients := make([]redlockClient, len(fakes))
+	for i, f := range fakes {
+		clients[i] = f
+	}
+	lock := &Lock{
+		clients:     clients,
+		counter:     &fakeCounterClient{incrErr: incrErr},
+		key:         t.Name(),
+		ttl:         5 * time.Second,
+		quorum:      len(clients)/2 + 1,
+		maxAttempts: 1,
+	}
+
+	acquired, token, err := lock.Acquire(context.Background())
+	if acquired {
+		t.Errorf("expected acquired=false, got true")
+	}
+	if !errors.Is(err, incrErr) {
+		t.Errorf("expected incrErr, got %v", err)
+	}
+	if token != 0 {
+		t.Errorf("expected token=0, got %d", token)
+	}
+	for i, f := range fakes {
+		if f.evalCalls != 1 {
+			t.Errorf("fake[%d] evalCalls = %d, want 1 (expected releaseAll after counter failure)", i, f.evalCalls)
+		}
+	}
+}
+
+func TestAcquireFailsWhenUUIDGenerationFails(t *testing.T) {
+	uuidErr := errors.New("uuid boom")
+	original := newUUID
+	newUUID = func() (uuid.UUID, error) { return uuid.UUID{}, uuidErr }
+	defer func() { newUUID = original }()
+
+	clients := []redlockClient{
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+		&fakeRedlockClient{setNXResult: true, evalResult: 1},
+	}
+	lock := &Lock{
+		clients:     clients,
+		key:         t.Name(),
+		ttl:         5 * time.Second,
+		quorum:      len(clients)/2 + 1,
+		maxAttempts: 1,
+	}
+
+	acquired, token, err := lock.Acquire(context.Background())
+	if acquired {
+		t.Errorf("expected acquired=false, got true")
+	}
+	if !errors.Is(err, uuidErr) {
+		t.Errorf("expected uuidErr, got %v", err)
+	}
+	if token != 0 {
+		t.Errorf("expected token=0, got %d", token)
 	}
 }
 

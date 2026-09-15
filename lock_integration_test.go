@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const counterMasterName = "mymaster"
+
 func testAddrs() []string {
 	if v := os.Getenv("JOINT_TEST_REDIS_ADDRS"); v != "" {
 		return strings.Split(v, ",")
@@ -18,8 +20,19 @@ func testAddrs() []string {
 		"localhost:6381", "localhost:6382", "localhost:6383"}
 }
 
+func counterSentinelAddrs() []string {
+	if v := os.Getenv("JOINT_TEST_SENTINEL_ADDRS"); v != "" {
+		return strings.Split(v, ",")
+	}
+	return []string{"localhost:6386", "localhost:6387", "localhost:6388"}
+}
+
+func withTestCounter() Option {
+	return WithCounter(counterMasterName, counterSentinelAddrs())
+}
+
 func TestAcquireRelease(t *testing.T) {
-	lock := New(testAddrs()[:1], t.Name(), 5*time.Second)
+	lock := New(testAddrs()[:1], t.Name(), 5*time.Second, withTestCounter())
 	acquired, _, err := lock.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire returned error: %v", err)
@@ -35,7 +48,7 @@ func TestAcquireRelease(t *testing.T) {
 }
 
 func TestAcquireThenExtend(t *testing.T) {
-	lock := New(testAddrs()[:1], t.Name(), 5*time.Second)
+	lock := New(testAddrs()[:1], t.Name(), 5*time.Second, withTestCounter())
 	acquired, _, err := lock.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire returned error: %v", err)
@@ -59,8 +72,8 @@ func TestAcquireThenExtend(t *testing.T) {
 }
 
 func TestAcquireFailsWhileHeld(t *testing.T) {
-	holder := New(testAddrs()[:1], t.Name(), 5*time.Second)
-	contender := New(testAddrs()[:1], t.Name(), 5*time.Second)
+	holder := New(testAddrs()[:1], t.Name(), 5*time.Second, withTestCounter())
+	contender := New(testAddrs()[:1], t.Name(), 5*time.Second, withTestCounter())
 	holderAcquired, _, err := holder.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire for holder returned error: %v", err)
@@ -95,7 +108,7 @@ func TestReleaseWithoutOwnership(t *testing.T) {
 
 func TestQuorumSucceedsAgainstMinorityContention(t *testing.T) {
 	addrs := testAddrs()
-	contended := New(addrs[:2], t.Name(), 5*time.Second)
+	contended := New(addrs[:2], t.Name(), 5*time.Second, withTestCounter())
 	contendedAcquired, _, err := contended.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire for contended returned error: %v", err)
@@ -103,7 +116,7 @@ func TestQuorumSucceedsAgainstMinorityContention(t *testing.T) {
 	if !contendedAcquired {
 		t.Fatalf("expected contendedAcquired=true, got false")
 	}
-	main := New(addrs, t.Name(), 5*time.Second)
+	main := New(addrs, t.Name(), 5*time.Second, withTestCounter())
 	mainAcquired, _, err := main.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire for main returned error: %v", err)
@@ -122,9 +135,8 @@ func TestQuorumSucceedsAgainstMinorityContention(t *testing.T) {
 }
 
 func TestQuorumFailsAgainstMajorityContention(t *testing.T) {
-	addrs := []string{"localhost:6379", "localhost:6380",
-		"localhost:6381", "localhost:6382", "localhost:6383"}
-	contended := New(addrs[:3], t.Name(), 5*time.Second)
+	addrs := testAddrs()
+	contended := New(addrs[:3], t.Name(), 5*time.Second, withTestCounter())
 	contendedAcquired, _, err := contended.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire for contended returned error: %v", err)
@@ -132,7 +144,7 @@ func TestQuorumFailsAgainstMajorityContention(t *testing.T) {
 	if !contendedAcquired {
 		t.Fatalf("expected contendedAcquired=true, got false")
 	}
-	main := New(addrs, t.Name(), 5*time.Second)
+	main := New(addrs, t.Name(), 5*time.Second, withTestCounter())
 	mainAcquired, _, err := main.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire for main returned error: %v", err)
@@ -140,7 +152,7 @@ func TestQuorumFailsAgainstMajorityContention(t *testing.T) {
 	if mainAcquired {
 		t.Errorf("expected mainAcquired=false, got true")
 	}
-	check := New(addrs[3:], t.Name(), 5*time.Second)
+	check := New(addrs[3:], t.Name(), 5*time.Second, withTestCounter())
 	checkAcquired, _, err := check.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("Acquire for check returned error: %v", err)
@@ -163,7 +175,7 @@ func TestQuorumFailsAgainstMajorityContention(t *testing.T) {
 
 func TestFencingTokenIncreasesAcrossAcquisitions(t *testing.T) {
 	addrs := testAddrs()[:1]
-	lock := New(addrs, t.Name(), 5*time.Second)
+	lock := New(addrs, t.Name(), 5*time.Second, withTestCounter())
 	_, token1, err := lock.Acquire(context.Background())
 	if err != nil {
 		t.Fatalf("first Acquire returned error: %v", err)
